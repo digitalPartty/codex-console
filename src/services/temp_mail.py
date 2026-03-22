@@ -38,7 +38,8 @@ class TempMailService(BaseEmailService):
             config: 配置字典，支持以下键:
                 - base_url: Worker 域名地址，如 https://mail.example.com (必需)
                 - admin_password: Admin 密码，对应 x-admin-auth header (必需)
-                - domain: 邮箱域名，如 example.com (必需)
+                - domain: 邮箱域名，如 example.com，或多个域名用逗号分隔 (必需)
+                - domains: 域名列表，如 ["example.com", "test.com"]（可选，优先于 domain）
                 - enable_prefix: 是否启用前缀，默认 True
                 - timeout: 请求超时时间，默认 30
                 - max_retries: 最大重试次数，默认 3
@@ -46,10 +47,14 @@ class TempMailService(BaseEmailService):
         """
         super().__init__(EmailServiceType.TEMP_MAIL, name)
 
-        required_keys = ["base_url", "admin_password", "domain"]
+        required_keys = ["base_url", "admin_password"]
         missing_keys = [key for key in required_keys if not (config or {}).get(key)]
         if missing_keys:
             raise ValueError(f"缺少必需配置: {missing_keys}")
+
+        # 检查域名配置
+        if not (config or {}).get("domain") and not (config or {}).get("domains"):
+            raise ValueError("缺少必需配置: domain 或 domains")
 
         default_config = {
             "enable_prefix": True,
@@ -57,6 +62,19 @@ class TempMailService(BaseEmailService):
             "max_retries": 3,
         }
         self.config = {**default_config, **(config or {})}
+
+        # 解析域名列表
+        if self.config.get("domains"):
+            # 如果提供了 domains 列表，直接使用
+            self.domains = self.config["domains"]
+        elif "," in self.config.get("domain", ""):
+            # 如果 domain 包含逗号，分割为列表
+            self.domains = [d.strip() for d in self.config["domain"].split(",") if d.strip()]
+        else:
+            # 单个域名
+            self.domains = [self.config["domain"]]
+
+        logger.info(f"TempMail 服务配置了 {len(self.domains)} 个域名: {', '.join(self.domains)}")
 
         # 不走代理，proxy_url=None
         http_config = RequestConfig(
@@ -233,7 +251,8 @@ class TempMailService(BaseEmailService):
         suffix = ''.join(random.choices(string.ascii_lowercase, k=random.randint(1, 3)))
         name = letters + digits + suffix
 
-        domain = self.config["domain"]
+        # 随机选择一个域名
+        domain = random.choice(self.domains)
         enable_prefix = self.config.get("enable_prefix", True)
 
         body = {
@@ -283,78 +302,132 @@ class TempMailService(BaseEmailService):
         """
         从 TempMail 邮箱获取验证码
 
+        策略：
+        - 注册阶段（otp_sent_at=None）：不记录初始邮件，直接获取第一封新邮件
+        - 登录阶段（otp_sent_at!=None）：记录初始邮件 ID，只处理新邮件
+
         Args:
             email: 邮箱地址
             email_id: 未使用，保留接口兼容
             timeout: 超时时间（秒）
             pattern: 验证码正则
-            otp_sent_at: OTP 发送时间戳（暂未使用）
+            otp_sent_at: OTP 发送时间戳（用于判断是注册还是登录阶段）
 
         Returns:
             验证码字符串，超时返回 None
         """
         logger.info(f"正在从 TempMail 邮箱 {email} 获取验证码...")
 
-        start_time = time.time()
-        seen_mail_ids: set = set()
+        # 记录已处理的邮件 ID
+        processed_mail_ids = set()
 
-        # 优先使用用户级 JWT，回退到 admin API
-        cached = self._email_cache.get(email, {})
-        jwt = cached.get("jwt")
+        # 只在登录阶段（otp_sent_at != None）才记录初始邮件
+        if otp_sent_at is not None:
+            try:
+                response = self._make_request(
+                    "GET",
+                    "/admin/mails",
+                    params={"limit": 20, "offset": 0, "address": email},
+                )
+                existing_mails = response.get("results", [])
+                if isinstance(existing_mails, list):
+                    processed_mail_ids = {mail.get("id") for mail in existing_mails if mail.get("id")}
+                    logger.info(f"登录阶段：开始时已有 {len(processed_mail_ids)} 封邮件，ID: {processed_mail_ids}")
+            except Exception as e:
+                logger.warning(f"获取初始邮件列表失败: {e}")
+        else:
+            logger.info(f"注册阶段：不记录初始邮件，等待第一封新邮件")
+
+        start_time = time.time()
+        stage = "登录" if otp_sent_at else "注册"
+        check_count = 0
+        last_mail_count = 0
 
         while time.time() - start_time < timeout:
-            try:
-                if jwt:
-                    response = self._make_request(
-                        "GET",
-                        "/user_api/mails",
-                        params={"limit": 20, "offset": 0},
-                        headers={"x-user-token": jwt, "Content-Type": "application/json", "Accept": "application/json"},
-                    )
-                else:
-                    response = self._make_request(
-                        "GET",
-                        "/admin/mails",
-                        params={"limit": 20, "offset": 0, "address": email},
-                    )
+            check_count += 1
+            elapsed = int(time.time() - start_time)
 
-                # /user_api/mails 和 /admin/mails 返回格式相同: {"results": [...], "total": N}
+            # 每 10 秒输出一次进度日志
+            if check_count == 1 or elapsed % 10 == 0:
+                logger.info(f"[{stage}] 第 {check_count} 次检查，已等待 {elapsed} 秒")
+
+            try:
+                # 使用 admin API 获取邮件列表
+                response = self._make_request(
+                    "GET",
+                    "/admin/mails",
+                    params={"limit": 20, "offset": 0, "address": email},
+                )
+
                 mails = response.get("results", [])
                 if not isinstance(mails, list):
-                    time.sleep(3)
+                    time.sleep(2)
                     continue
 
+                current_mail_count = len(mails)
+
+                # 只在邮件数量变化时输出详细日志
+                if current_mail_count != last_mail_count:
+                    logger.info(f"[{stage}] 邮件数量变化: {last_mail_count} -> {current_mail_count}")
+                    last_mail_count = current_mail_count
+
+                # 处理邮件列表（按 ID 倒序，优先处理最新邮件）
                 for mail in mails:
                     mail_id = mail.get("id")
-                    if not mail_id or mail_id in seen_mail_ids:
+                    if not mail_id:
                         continue
 
-                    seen_mail_ids.add(mail_id)
+                    # 跳过已处理过的邮件
+                    if mail_id in processed_mail_ids:
+                        continue
+
+                    # 标记为已处理
+                    processed_mail_ids.add(mail_id)
+
+                    created_at_str = mail.get("created_at") or mail.get("createdAt")
+                    logger.info(f"[{stage}] 发现新邮件 {mail_id}，时间: {created_at_str}")
 
                     parsed = self._extract_mail_fields(mail)
                     sender = parsed["sender"].lower()
                     subject = parsed["subject"]
                     body_text = parsed["body"]
                     raw_text = parsed["raw"]
+
+                    # 合并多个空格为一个，避免 HTML 标签移除后的空格问题
                     content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+                    content = re.sub(r'\s+', ' ', content)
 
                     # 只处理 OpenAI 邮件
                     if "openai" not in sender and "openai" not in content.lower():
+                        logger.debug(f"[{stage}] 跳过非 OpenAI 邮件: {mail_id}")
                         continue
 
+                    logger.info(f"[{stage}] 邮件 {mail_id} 是 OpenAI 邮件，发件人: {sender[:50]}")
+
+                    # 合并多个空格为一个，避免 HTML 标签移除后的空格问题
+                    content = f"{sender}\n{subject}\n{body_text}\n{raw_text}".strip()
+                    content = re.sub(r'\s+', ' ', content)
+
+                    # 匹配验证码
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
-                        logger.info(f"从 TempMail 邮箱 {email} 找到验证码: {code}")
+                        logger.info(f"[{stage}] ✓ 成功提取验证码: {code} (邮件 ID: {mail_id})")
                         self.update_status(True)
                         return code
+                    else:
+                        logger.warning(f"[{stage}] 邮件 {mail_id} 未匹配到验证码")
 
             except Exception as e:
-                logger.debug(f"检查 TempMail 邮件时出错: {e}")
+                logger.error(f"[{stage}] 检查邮件时出错: {e}")
+                # 出错后等待更长时间再重试
+                time.sleep(3)
+                continue
 
-            time.sleep(3)
+            # 正常情况下等待 2 秒
+            time.sleep(2)
 
-        logger.warning(f"等待 TempMail 验证码超时: {email}")
+        logger.warning(f"[{stage}] 等待验证码超时 ({timeout}秒): {email}")
         return None
 
     def list_emails(self, limit: int = 100, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:

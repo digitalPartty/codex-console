@@ -455,7 +455,7 @@ class RegistrationEngine:
     def _complete_token_exchange(self, result: RegistrationResult) -> bool:
         """在登录态已建立后，继续完成 workspace 和 OAuth token 获取。"""
         self._log("等待登录验证码到场，最后这位嘉宾还在路上...")
-        code = self._get_verification_code()
+        code = self._get_verification_code(is_login_stage=True)
         if not code:
             result.error_message = "获取验证码失败"
             return False
@@ -625,8 +625,12 @@ class RegistrationEngine:
             self._log(f"发送验证码失败: {e}", "error")
             return False
 
-    def _get_verification_code(self) -> Optional[str]:
-        """获取验证码"""
+    def _get_verification_code(self, is_login_stage: bool = False) -> Optional[str]:
+        """获取验证码
+
+        Args:
+            is_login_stage: 是否是登录阶段（True 表示登录，False 表示注册）
+        """
         try:
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
 
@@ -634,9 +638,9 @@ class RegistrationEngine:
             code = self.email_service.get_verification_code(
                 email=self.email,
                 email_id=email_id,
-                timeout=120,
+                timeout=30,
                 pattern=OTP_CODE_PATTERN,
-                otp_sent_at=self._otp_sent_at,
+                otp_sent_at=self._otp_sent_at if is_login_stage else None,
             )
 
             if code:

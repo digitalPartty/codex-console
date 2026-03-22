@@ -198,6 +198,9 @@ def batch_upload_to_cpa(
     Returns:
         包含成功/失败统计和详情的字典
     """
+    logger.info(f"开始批量上传 {len(account_ids)} 个账号到 CPA")
+    logger.info(f"CPA API URL: {api_url if api_url else '使用全局配置'}")
+
     results = {
         "success_count": 0,
         "failed_count": 0,
@@ -207,9 +210,11 @@ def batch_upload_to_cpa(
 
     with get_db() as db:
         for account_id in account_ids:
+            logger.info(f"处理账号 ID: {account_id}")
             account = db.query(Account).filter(Account.id == account_id).first()
 
             if not account:
+                logger.warning(f"账号 ID {account_id} 不存在")
                 results["failed_count"] += 1
                 results["details"].append({
                     "id": account_id,
@@ -221,6 +226,7 @@ def batch_upload_to_cpa(
 
             # 检查是否已有 Token
             if not account.access_token:
+                logger.warning(f"账号 {account.email} (ID: {account_id}) 缺少 Token")
                 results["skipped_count"] += 1
                 results["details"].append({
                     "id": account_id,
@@ -232,6 +238,7 @@ def batch_upload_to_cpa(
 
             # 生成 Token JSON
             token_data = generate_token_json(account)
+            logger.info(f"开始上传账号 {account.email} (ID: {account_id})")
 
             # 上传
             success, message = upload_to_cpa(token_data, proxy, api_url=api_url, api_token=api_token)
@@ -242,6 +249,7 @@ def batch_upload_to_cpa(
                 account.cpa_uploaded_at = datetime.utcnow()
                 db.commit()
 
+                logger.info(f"✓ 账号 {account.email} 上传成功")
                 results["success_count"] += 1
                 results["details"].append({
                     "id": account_id,
@@ -250,6 +258,7 @@ def batch_upload_to_cpa(
                     "message": message
                 })
             else:
+                logger.error(f"✗ 账号 {account.email} 上传失败: {message}")
                 results["failed_count"] += 1
                 results["details"].append({
                     "id": account_id,
@@ -258,6 +267,7 @@ def batch_upload_to_cpa(
                     "error": message
                 })
 
+    logger.info(f"批量上传完成: 成功 {results['success_count']}, 失败 {results['failed_count']}, 跳过 {results['skipped_count']}")
     return results
 
 
