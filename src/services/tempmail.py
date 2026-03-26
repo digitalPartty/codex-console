@@ -129,12 +129,16 @@ class TempmailService(BaseEmailService):
         """
         从 Tempmail.lol 获取验证码
 
+        策略：
+        - 注册阶段（otp_sent_at=None）：不记录初始邮件，直接获取第一封新邮件
+        - 登录阶段（otp_sent_at!=None）：记录初始邮件 date，只处理新邮件
+
         Args:
             email: 邮箱地址
             email_id: 邮箱 token（如果不提供，从缓存中查找）
             timeout: 超时时间（秒）
             pattern: 验证码正则表达式
-            otp_sent_at: OTP 发送时间戳（Tempmail 服务暂不使用此参数）
+            otp_sent_at: OTP 发送时间戳（用于判断是注册还是登录阶段）
 
         Returns:
             验证码字符串，如果超时或未找到返回 None
@@ -152,12 +156,46 @@ class TempmailService(BaseEmailService):
             logger.warning(f"邮箱 {email} 没有 token，无法获取验证码")
             return None
 
+        # 记录已处理的邮件 date（用于去重）
+        seen_dates = set()
+
+        # 记录开始时的基准时间（相对时间，避免时差问题）
+        baseline_time = time.time()
+
+        # 只在登录阶段（otp_sent_at != None）才记录初始邮件
+        if otp_sent_at is not None:
+            try:
+                response = self.http_client.get(
+                    f"{self.config['base_url']}/inbox",
+                    params={"token": token},
+                    headers={"Accept": "application/json"}
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    existing_emails = data.get("emails", []) if isinstance(data, dict) else []
+                    if isinstance(existing_emails, list):
+                        seen_dates = {msg.get("date") for msg in existing_emails if msg.get("date")}
+                        logger.info(f"登录阶段：开始时已有 {len(seen_dates)} 封邮件")
+            except Exception as e:
+                logger.warning(f"获取初始邮件列表失败: {e}")
+        else:
+            logger.info(f"注册阶段：不记录初始邮件，等待第一封新邮件")
+
         logger.info(f"正在等邮箱 {email} 的验证码，邮差应该在路上了...")
 
         start_time = time.time()
-        seen_ids = set()
+        stage = "登录" if otp_sent_at else "注册"
+        check_count = 0
 
         while time.time() - start_time < timeout:
+            check_count += 1
+            elapsed = int(time.time() - start_time)
+
+            # 每 10 秒输出一次进度日志
+            if check_count == 1 or elapsed % 10 == 0:
+                logger.info(f"[{stage}] 第 {check_count} 次检查，已等待 {elapsed} 秒")
+
             try:
                 # 获取邮件列表
                 response = self.http_client.get(
@@ -189,9 +227,17 @@ class TempmailService(BaseEmailService):
 
                     # 使用 date 作为唯一标识
                     msg_date = msg.get("date", 0)
-                    if not msg_date or msg_date in seen_ids:
+                    if not msg_date:
                         continue
-                    seen_ids.add(msg_date)
+
+                    # 跳过已处理过的邮件
+                    if msg_date in seen_dates:
+                        continue
+
+                    # 标记为已处理
+                    seen_dates.add(msg_date)
+
+                    logger.info(f"[{stage}] 发现新邮件，date: {msg_date}")
 
                     sender = str(msg.get("from", "")).lower()
                     subject = str(msg.get("subject", ""))
@@ -202,23 +248,31 @@ class TempmailService(BaseEmailService):
 
                     # 检查是否是 OpenAI 邮件
                     if "openai" not in sender and "openai" not in content.lower():
+                        logger.debug(f"[{stage}] 跳过非 OpenAI 邮件，date: {msg_date}")
                         continue
+
+                    logger.info(f"[{stage}] 邮件 {msg_date} 是 OpenAI 邮件，发件人: {sender[:50]}")
 
                     # 提取验证码
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
-                        logger.info(f"找到验证码了，六位嘉宾登场: {code}")
+                        logger.info(f"[{stage}] 成功提取验证码: {code} (邮件 date: {msg_date})")
                         self.update_status(True)
                         return code
+                    else:
+                        logger.warning(f"[{stage}] 邮件 {msg_date} 未匹配到验证码")
 
             except Exception as e:
-                logger.debug(f"检查邮件时出错: {e}")
+                logger.error(f"[{stage}] 检查邮件时出错: {e}")
+                # 出错后等待更长时间再重试
+                time.sleep(3)
+                continue
 
-            # 等待一段时间再检查
-            time.sleep(3)
+            # 正常情况下等待 2 秒
+            time.sleep(2)
 
-        logger.warning(f"等验证码等到超时了: {email}")
+        logger.warning(f"[{stage}] 等待验证码超时 ({timeout}秒): {email}")
         return None
 
     def list_emails(self, **kwargs) -> List[Dict[str, Any]]:

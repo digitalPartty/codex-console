@@ -132,6 +132,7 @@ class RegistrationEngine:
         self.session_token: Optional[str] = None  # 会话令牌
         self.logs: list = []
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
+        self._used_verification_codes: set = set()  # 已使用的验证码集合(防止重复使用)
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
 
@@ -631,28 +632,51 @@ class RegistrationEngine:
         Args:
             is_login_stage: 是否是登录阶段（True 表示登录，False 表示注册）
         """
-        try:
-            self._log(f"正在等待邮箱 {self.email} 的验证码...")
+        max_retries = 3
+        retry_count = 0
+        stage = "登录" if is_login_stage else "注册"
 
-            email_id = self.email_info.get("service_id") if self.email_info else None
-            code = self.email_service.get_verification_code(
-                email=self.email,
-                email_id=email_id,
-                timeout=30,
-                pattern=OTP_CODE_PATTERN,
-                otp_sent_at=self._otp_sent_at if is_login_stage else None,
-            )
+        while retry_count < max_retries:
+            try:
+                self._log(f"[{stage}] 正在等待邮箱 {self.email} 的验证码...")
 
-            if code:
-                self._log(f"成功获取验证码: {code}")
+                email_id = self.email_info.get("service_id") if self.email_info else None
+                code = self.email_service.get_verification_code(
+                    email=self.email,
+                    email_id=email_id,
+                    timeout=120,  # 增加超时时间到120秒
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=self._otp_sent_at if is_login_stage else None,
+                )
+
+                if not code:
+                    self._log(f"[{stage}] 等待验证码超时", "error")
+                    return None
+
+                # 检查验证码是否已使用
+                if code in self._used_verification_codes:
+                    self._log(
+                        f"[{stage}] 警告: 获取到已使用的验证码: {code}，这是第 {retry_count + 1} 次重试，等待新验证码...",
+                        "warning"
+                    )
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        time.sleep(5)  # 等待5秒后重试
+                        continue
+                    else:
+                        self._log(f"[{stage}] 多次获取到重复验证码，超过重试次数", "error")
+                        return None
+
+                # 新验证码，记录并返回
+                self._used_verification_codes.add(code)
+                self._log(f"[{stage}] 成功获取验证码: {code} (首次使用)")
                 return code
-            else:
-                self._log("等待验证码超时", "error")
+
+            except Exception as e:
+                self._log(f"[{stage}] 获取验证码失败: {e}", "error")
                 return None
 
-        except Exception as e:
-            self._log(f"获取验证码失败: {e}", "error")
-            return None
+        return None
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
@@ -670,7 +694,23 @@ class RegistrationEngine:
             )
 
             self._log(f"验证码校验状态: {response.status_code}")
-            return response.status_code == 200
+
+            if response.status_code == 200:
+                self._log(f"验证码 {code} 校验成功")
+                return True
+            else:
+                # 记录详细的失败信息
+                try:
+                    error_data = response.json()
+                    error_code = error_data.get("error", {}).get("code", "unknown")
+                    self._log(f"验证码 {code} 校验失败: {error_code}", "error")
+
+                    if error_code == "wrong_email_otp_code":
+                        self._log("可能原因: 验证码已过期或已被使用", "warning")
+                except Exception:
+                    self._log(f"验证码 {code} 校验失败: HTTP {response.status_code}", "error")
+
+                return False
 
         except Exception as e:
             self._log(f"验证验证码失败: {e}", "error")

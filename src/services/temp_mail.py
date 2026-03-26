@@ -412,7 +412,7 @@ class TempMailService(BaseEmailService):
                     match = re.search(pattern, content)
                     if match:
                         code = match.group(1)
-                        logger.info(f"[{stage}] ✓ 成功提取验证码: {code} (邮件 ID: {mail_id})")
+                        logger.info(f"[{stage}] 成功提取验证码: {code} (邮件 ID: {mail_id})")
                         self.update_status(True)
                         return code
                     else:
