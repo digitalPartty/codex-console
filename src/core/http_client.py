@@ -111,8 +111,15 @@ class HTTPClient:
             kwargs["proxies"] = self.proxies
 
         last_exception = None
+        http2_failed = False
+
         for attempt in range(self.config.max_retries):
             try:
+                # 如果 HTTP/2 失败过，尝试降级到 HTTP/1.1
+                if http2_failed and "http_version" not in kwargs:
+                    kwargs["http_version"] = cffi_requests.CurlHttpVersion.V1_1
+                    logger.info(f"降级到 HTTP/1.1 重试: {method} {url}")
+
                 response = self.session.request(method, url, **kwargs)
 
                 # 检查响应状态码
@@ -131,11 +138,22 @@ class HTTPClient:
 
             except (cffi_requests.RequestsError, ConnectionError, TimeoutError) as e:
                 last_exception = e
+                error_str = str(e).lower()
+
+                # 检测 curl 错误 16 (HTTP/2 framing layer 问题)
+                if "curl: (16)" in error_str or "http2" in error_str:
+                    logger.warning(f"检测到 HTTP/2 连接问题: {e}")
+                    http2_failed = True
+
                 logger.warning(
                     f"请求失败: {method} {url} (attempt {attempt + 1}/{self.config.max_retries}): {e}"
                 )
 
                 if attempt < self.config.max_retries - 1:
+                    # 如果是 HTTP/2 问题，立即重试（不等待）
+                    if http2_failed and attempt == 0:
+                        logger.info("立即使用 HTTP/1.1 重试")
+                        continue
                     time.sleep(self.config.retry_delay * (attempt + 1))
                 else:
                     break

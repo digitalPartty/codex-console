@@ -307,7 +307,8 @@ class RegistrationEngine:
                 })
                 headers["openai-sentinel-token"] = sentinel
 
-            response = self.session.post(
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["signup"],
                 headers=headers,
                 data=request_body,
@@ -384,7 +385,8 @@ class RegistrationEngine:
     def _submit_login_password(self) -> SignupFormResult:
         """提交登录密码，进入邮箱验证码页面。"""
         try:
-            response = self.session.post(
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["password_verify"],
                 headers={
                     "referer": "https://auth.openai.com/log-in/password",
@@ -546,7 +548,8 @@ class RegistrationEngine:
                 "username": self.email
             })
 
-            response = self.session.post(
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["register"],
                 headers={
                     "referer": "https://auth.openai.com/create-account/password",
@@ -611,7 +614,8 @@ class RegistrationEngine:
             # 记录发送时间戳
             self._otp_sent_at = time.time()
 
-            response = self.session.get(
+            response = self.http_client.request(
+                "GET",
                 OPENAI_API_ENDPOINTS["send_otp"],
                 headers={
                     "referer": "https://auth.openai.com/create-account/password",
@@ -647,6 +651,7 @@ class RegistrationEngine:
                     timeout=120,  # 增加超时时间到120秒
                     pattern=OTP_CODE_PATTERN,
                     otp_sent_at=self._otp_sent_at if is_login_stage else None,
+                    exclude_codes=self._used_verification_codes,
                 )
 
                 if not code:
@@ -683,7 +688,11 @@ class RegistrationEngine:
         try:
             code_body = f'{{"code":"{code}"}}'
 
-            response = self.session.post(
+            # 使用 http_client.request 而非直接 session.post
+            # 这样可以利用 HTTPClient 的自动重试和 HTTP/2→HTTP/1.1 降级逻辑
+            # 避免 curl: (16) HTTP/2 framing layer 错误
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["validate_otp"],
                 headers={
                     "referer": "https://auth.openai.com/email-verification",
@@ -723,7 +732,8 @@ class RegistrationEngine:
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
             create_account_body = json.dumps(user_info)
 
-            response = self.session.post(
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["create_account"],
                 headers={
                     "referer": "https://auth.openai.com/about-you",
@@ -795,7 +805,8 @@ class RegistrationEngine:
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
 
-            response = self.session.post(
+            response = self.http_client.request(
+                "POST",
                 OPENAI_API_ENDPOINTS["select_workspace"],
                 headers={
                     "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
